@@ -1,0 +1,28 @@
+{
+  "name": "codex-turn-sound",
+  "version": "0.1.0",
+  "description": "Play a small chime when a Codex turn ends.",
+  "license": "MIT",
+  "bin": {
+    "codex-turn-sound": "./bin/codex-turn-sound"
+  },
+  "files": [
+    "assets/",
+    "bin/",
+    "scripts/install.py",
+    "scripts/make_sound.py",
+    "scripts/uninstall.py",
+    "install.sh",
+    "uninstall.sh",
+    "README.md"
+  ],
+  "keywords": [
+    "codex",
+    "notification",
+    "sound",
+    "chime"
+  ],
+  "scripts": {
+    "test": "zsh -n bin/codex-turn-sound && python3 -m py_compile scripts/install.py scripts/uninstall.py scripts/make_sound.py"
+  }
+}
