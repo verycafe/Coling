@@ -18,22 +18,50 @@ from typing import Any
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
-STATE_DIR = Path.home() / ".codex" / "codex-turn-sound"
+STATE_DIR = Path(os.environ.get("CODEX_TURN_SOUND_STATE_DIR", Path.home() / ".codex" / "codex-turn-sound")).expanduser()
 INSTALL_ROOT = STATE_DIR / "app"
 TARGET_NOTIFY = INSTALL_ROOT / "bin" / "codex-turn-sound"
 DEFAULT_SOUND = INSTALL_ROOT / "assets" / "soft-chime.wav"
 STATE_JSON = STATE_DIR / "state.json"
 STATE_ZSH = STATE_DIR / "original-notify.zsh"
-NOTIFY_RE = re.compile(r"(?m)^(?P<prefix>\s*notify\s*=\s*)(?P<value>\[[^\n]*\])(?P<suffix>\s*(?:#.*)?$)")
+ROOT_NOTIFY_RE = re.compile(r"^\s*notify\s*=")
+TABLE_HEADER_RE = re.compile(r"^\s*\[")
+
+
+def parse_notify_value(value_text: str) -> list[str]:
+    value = ast.literal_eval(value_text)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("notify must be a string array")
+    return value
+
+
+def root_table_start(lines: list[str]) -> int:
+    for index, line in enumerate(lines):
+        if TABLE_HEADER_RE.match(line):
+            return index
+    return len(lines)
+
+
+def find_root_notify(text: str) -> tuple[list[str], int | None, int | None, list[str] | None]:
+    lines = text.splitlines(keepends=True)
+    root_end = root_table_start(lines)
+    for start in range(root_end):
+        if not ROOT_NOTIFY_RE.match(lines[start]):
+            continue
+        for stop in range(start + 1, root_end + 1):
+            candidate = "".join(lines[start:stop])
+            value_text = candidate.split("=", 1)[1]
+            try:
+                value = parse_notify_value(value_text)
+            except (SyntaxError, ValueError):
+                continue
+            return lines, start, stop, value
+        raise ValueError("root notify exists but is not a string array")
+    return lines, None, None, None
 
 
 def parse_notify(text: str) -> list[str] | None:
-    match = NOTIFY_RE.search(text)
-    if not match:
-        return None
-    value = ast.literal_eval(match.group("value"))
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("notify must be a string array")
+    _, _, _, value = find_root_notify(text)
     return value
 
 
@@ -43,16 +71,20 @@ def toml_array(items: list[str]) -> str:
 
 def write_notify(text: str, notify: list[str]) -> str:
     rendered = toml_array(notify)
-    if NOTIFY_RE.search(text):
-        return NOTIFY_RE.sub(lambda match: f"{match.group('prefix')}{rendered}{match.group('suffix')}", text, count=1)
+    lines, start, stop, _ = find_root_notify(text)
+    if start is not None and stop is not None:
+        lines[start:stop] = [f"notify = {rendered}\n"]
+        return "".join(lines)
 
-    section = re.search(r"(?m)^\[", text)
-    insertion = f"notify = {rendered}\n\n"
-    if section:
-        return text[: section.start()] + insertion + text[section.start() :]
-    if text and not text.endswith("\n"):
-        text += "\n"
-    return text + "\n" + insertion
+    root_end = root_table_start(lines)
+    insertion = [f"notify = {rendered}\n", "\n"]
+    if root_end == 0:
+        lines[0:0] = insertion
+        return "".join(lines)
+    if lines and not lines[root_end - 1].endswith("\n"):
+        lines[root_end - 1] += "\n"
+    lines[root_end:root_end] = insertion
+    return "".join(lines)
 
 
 def shell_array(items: list[str]) -> str:
@@ -82,7 +114,7 @@ def is_this_tool(command: list[str] | None) -> bool:
         path = Path(command[0]).expanduser().resolve()
     except OSError:
         return False
-    return path == TARGET_NOTIFY.resolve() or path.name == "codex-turn-sound"
+    return path == TARGET_NOTIFY.resolve()
 
 
 def legacy_original_notify(command: list[str] | None) -> list[str] | None:
@@ -181,8 +213,12 @@ def install(config_path: Path, sound_path: Path) -> None:
         shutil.copy2(config_path, backup_path)
 
     new_notify = [str(TARGET_NOTIFY), "turn-ended"]
-    config_path.write_text(write_notify(text, new_notify))
-    validate_toml(config_path)
+    try:
+        config_path.write_text(write_notify(text, new_notify))
+        validate_toml(config_path)
+    except Exception:
+        config_path.write_text(text)
+        raise
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_JSON.write_text(

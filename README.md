@@ -6,69 +6,100 @@ This uses Codex's native `notify` command, so it does not depend on a Skill bein
 
 ## Install
 
-One-line install after the package is published to npm:
-
-```sh
-npx --yes codex-turn-sound install
-```
-
-One-line install directly from GitHub before publishing to npm:
+Install directly from GitHub:
 
 ```sh
 npm exec --yes --package github:verycafe/Coling codex-turn-sound -- install
-```
-
-Manual install from a cloned repository:
-
-```sh
-git clone https://github.com/verycafe/Coling.git
-cd Coling
-./install.sh
 ```
 
 Restart Codex or open a new Codex session after installing.
 
 ## Test
 
+Play the sound manually:
+
 ```sh
-codex-turn-sound turn-ended
+~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
 ```
 
-You should hear the bundled `assets/soft-chime.wav`.
+Then test the Codex lifecycle:
 
-To test the Codex lifecycle, start a new Codex session and ask it to answer a tiny prompt. The sound should play after the assistant finishes the turn.
+1. Open a new Codex session.
+2. Send a tiny prompt, for example: `只回复“测试完成”`
+3. After Codex finishes the turn, you should hear the bundled chime.
+
+## How It Works
+
+The installer updates `~/.codex/config.toml` with your real home directory:
+
+```sh
+notify = ["/Users/you/.codex/codex-turn-sound/app/bin/codex-turn-sound", "turn-ended"]
+```
+
+Codex calls this command when a turn ends. The installer copies the runtime into `~/.codex/codex-turn-sound/app/`, so the tool keeps working even when the temporary `npm exec` download is removed.
+
+If a previous Codex `notify` command existed, this tool preserves it and runs it before playing the sound.
 
 ## Change the Sound
 
 Use a macOS system sound by name:
 
 ```sh
-CODEX_TURN_SOUND=Glass codex-turn-sound turn-ended
+CODEX_TURN_SOUND=Glass ~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
 ```
 
 Use any audio file supported by `afplay`:
 
 ```sh
-CODEX_TURN_SOUND=/absolute/path/to/sound.wav codex-turn-sound turn-ended
+CODEX_TURN_SOUND=/absolute/path/to/sound.wav ~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
 ```
 
 Disable sound for one run:
 
 ```sh
-CODEX_TURN_SOUND=off codex-turn-sound turn-ended
+CODEX_TURN_SOUND=off ~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
 ```
 
-To make a custom generated sound and install it:
+Install with a custom sound:
 
 ```sh
-python3 scripts/make_sound.py assets/my-chime.wav
-./install.sh --sound "$(pwd)/assets/my-chime.wav"
+npm exec --yes --package github:verycafe/Coling codex-turn-sound -- install --sound /absolute/path/to/sound.wav
 ```
 
 ## Uninstall
 
 ```sh
+npm exec --yes --package github:verycafe/Coling codex-turn-sound -- uninstall
+```
+
+The uninstaller restores the previous `notify` command when one was present.
+
+## After Publishing to npm
+
+If this package is published to the npm registry as `codex-turn-sound`, install and uninstall become:
+
+```sh
+npx --yes codex-turn-sound install
 npx --yes codex-turn-sound uninstall
 ```
 
-The installer backs up `~/.codex/config.toml` before editing it and preserves any previous `notify` command by chaining it from the runtime wrapper.
+## Develop Locally
+
+Clone the repository:
+
+```sh
+git clone https://github.com/verycafe/Coling.git
+cd Coling
+```
+
+Run checks:
+
+```sh
+npm test
+```
+
+Generate the bundled sound again:
+
+```sh
+python3 scripts/make_sound.py assets/soft-chime.wav
+```

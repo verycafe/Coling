@@ -6,25 +6,55 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
 import shutil
 import time
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-TARGET_NOTIFY = REPO_ROOT / "bin" / "codex-turn-sound"
-STATE_JSON = Path.home() / ".codex" / "codex-turn-sound" / "state.json"
-NOTIFY_RE = re.compile(r"(?m)^(?P<prefix>\s*notify\s*=\s*)(?P<value>\[[^\n]*\])(?P<suffix>\s*(?:#.*)?$)")
+STATE_DIR = Path(os.environ.get("CODEX_TURN_SOUND_STATE_DIR", Path.home() / ".codex" / "codex-turn-sound")).expanduser()
+INSTALL_ROOT = STATE_DIR / "app"
+TARGET_NOTIFY = INSTALL_ROOT / "bin" / "codex-turn-sound"
+STATE_JSON = STATE_DIR / "state.json"
+ROOT_NOTIFY_RE = re.compile(r"^\s*notify\s*=")
+TABLE_HEADER_RE = re.compile(r"^\s*\[")
+
+
+def parse_notify_value(value_text: str) -> list[str]:
+    value = ast.literal_eval(value_text)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("notify must be a string array")
+    return value
+
+
+def root_table_start(lines: list[str]) -> int:
+    for index, line in enumerate(lines):
+        if TABLE_HEADER_RE.match(line):
+            return index
+    return len(lines)
+
+
+def find_root_notify(text: str) -> tuple[list[str], int | None, int | None, list[str] | None]:
+    lines = text.splitlines(keepends=True)
+    root_end = root_table_start(lines)
+    for start in range(root_end):
+        if not ROOT_NOTIFY_RE.match(lines[start]):
+            continue
+        for stop in range(start + 1, root_end + 1):
+            candidate = "".join(lines[start:stop])
+            value_text = candidate.split("=", 1)[1]
+            try:
+                value = parse_notify_value(value_text)
+            except (SyntaxError, ValueError):
+                continue
+            return lines, start, stop, value
+        raise ValueError("root notify exists but is not a string array")
+    return lines, None, None, None
 
 
 def parse_notify(text: str) -> list[str] | None:
-    match = NOTIFY_RE.search(text)
-    if not match:
-        return None
-    value = ast.literal_eval(match.group("value"))
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("notify must be a string array")
+    _, _, _, value = find_root_notify(text)
     return value
 
 
@@ -47,17 +77,28 @@ def is_this_tool(command: list[str] | None) -> bool:
         path = Path(command[0]).expanduser().resolve()
     except OSError:
         return False
-    return path == TARGET_NOTIFY.resolve() or path.name == "codex-turn-sound"
+    return path == TARGET_NOTIFY.resolve()
 
 
 def replace_or_remove_notify(text: str, original_notify: list[str]) -> str:
+    lines, start, stop, _ = find_root_notify(text)
+    if start is None or stop is None:
+        return text
     if original_notify:
-        return NOTIFY_RE.sub(
-            lambda match: f"{match.group('prefix')}{toml_array(original_notify)}{match.group('suffix')}",
-            text,
-            count=1,
-        )
-    return NOTIFY_RE.sub("", text, count=1)
+        lines[start:stop] = [f"notify = {toml_array(original_notify)}\n"]
+    else:
+        lines[start:stop] = []
+    return "".join(lines)
+
+
+def load_state() -> dict:
+    if not STATE_JSON.exists():
+        return {}
+    try:
+        payload = json.loads(STATE_JSON.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def uninstall(config_path: Path) -> None:
@@ -71,7 +112,7 @@ def uninstall(config_path: Path) -> None:
         print("current notify is not codex-turn-sound; nothing changed")
         return
 
-    state = json.loads(STATE_JSON.read_text()) if STATE_JSON.exists() else {}
+    state = load_state()
     original_notify = state.get("original_notify", [])
     if not isinstance(original_notify, list):
         original_notify = []
