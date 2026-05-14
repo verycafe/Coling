@@ -2,19 +2,17 @@
 
 Play a short custom chime when a Codex turn ends.
 
-This uses Codex's native `notify` command, so it does not depend on a Skill being selected in a conversation. The installer writes the correct absolute path for each machine into `~/.codex/config.toml`.
+## One-line Install
 
-## Install
-
-Install directly from GitHub:
+Run this command:
 
 ```sh
 npm exec --yes --package github:verycafe/Coling codex-turn-sound -- install
 ```
 
-Restart Codex or open a new Codex session after installing.
+Then restart Codex or open a new Codex session.
 
-## Test
+## Quick Test
 
 Play the sound manually:
 
@@ -29,6 +27,8 @@ Then test the Codex lifecycle:
 3. After Codex finishes the turn, you should hear the bundled chime.
 
 ## How It Works
+
+This uses Codex's native `notify` command, so it does not depend on a Skill being selected in a conversation.
 
 The installer updates `~/.codex/config.toml` with your real home directory:
 
@@ -68,20 +68,13 @@ npm exec --yes --package github:verycafe/Coling codex-turn-sound -- install --so
 
 ## Uninstall
 
+Run:
+
 ```sh
 npm exec --yes --package github:verycafe/Coling codex-turn-sound -- uninstall
 ```
 
 The uninstaller restores the previous `notify` command when one was present.
-
-## After Publishing to npm
-
-If this package is published to the npm registry as `codex-turn-sound`, install and uninstall become:
-
-```sh
-npx --yes codex-turn-sound install
-npx --yes codex-turn-sound uninstall
-```
 
 ## Develop Locally
 
