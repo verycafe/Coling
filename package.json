@@ -1,17 +1,40 @@
 {
   "name": "codex-turn-sound",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Play a small chime when a Codex turn ends.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/verycafe/Coling.git"
+  },
+  "homepage": "https://github.com/verycafe/Coling#readme",
+  "bugs": {
+    "url": "https://github.com/verycafe/Coling/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": "^20.17.0 || >=22.9.0"
+  },
+  "packageManager": "npm@11.10.1",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "bin": {
-    "codex-turn-sound": "./bin/codex-turn-sound"
+    "codex-turn-sound": "bin/codex-turn-sound"
   },
   "files": [
     "LICENSE",
     "assets/",
     "bin/",
+    "scripts/common.py",
+    "scripts/config_toml.py",
+    "scripts/doctor.py",
     "scripts/install.py",
     "scripts/make_sound.py",
+    "scripts/notify_runtime.py",
     "scripts/uninstall.py",
     "install.sh",
     "uninstall.sh",
@@ -24,6 +47,7 @@
     "chime"
   ],
   "scripts": {
-    "test": "zsh -n bin/codex-turn-sound && python3 -m py_compile scripts/install.py scripts/uninstall.py scripts/make_sound.py"
+    "test": "zsh -n bin/codex-turn-sound && python3 -m py_compile scripts/common.py scripts/config_toml.py scripts/doctor.py scripts/install.py scripts/notify_runtime.py scripts/uninstall.py scripts/make_sound.py && python3 -m unittest discover -s tests -v",
+    "pack:check": "python3 tests/check_package.py"
   }
 }

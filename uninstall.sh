@@ -7,5 +7,9 @@ if ! command -v python3 >/dev/null 2>&1; then
   printf '%s\n' "python3 is required to uninstall codex-turn-sound." >&2
   exit 1
 fi
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))'; then
+  printf '%s\n' "Python 3.11 or newer is required to uninstall codex-turn-sound." >&2
+  exit 1
+fi
 
 exec python3 "$ROOT_DIR/scripts/uninstall.py" "$@"

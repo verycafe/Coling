@@ -1,97 +1,116 @@
 # codex-turn-sound
 
-Play a short custom chime when a Codex turn ends.
+Play a short chime when a Codex turn ends.
 
 ## One-line Install
 
-Run this command:
-
 ```sh
-npm exec --yes --package github:verycafe/Coling codex-turn-sound -- install
+npm exec --yes --package='github:verycafe/Coling#v0.2.0' -- codex-turn-sound install
 ```
 
-Then restart Codex or open a new Codex session.
+Restart Codex or open a new Codex session after installation.
+
+Requirements: macOS, Node.js 22.9 or newer with npm, and Python 3.11 or
+newer. Node.js 20.17 remains supported for legacy compatibility.
 
 ## Quick Test
 
-Play the sound manually:
-
 ```sh
-~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
+"${CODEX_HOME:-$HOME/.codex}/codex-turn-sound/app/bin/codex-turn-sound" turn-ended
 ```
 
-Then test the Codex lifecycle:
+For a lifecycle test:
 
 1. Open a new Codex session.
-2. Send a tiny prompt, for example: `只回复“测试完成”`
-3. After Codex finishes the turn, you should hear the bundled chime.
+2. Send a tiny prompt, such as `只回复“测试完成”`.
+3. Wait for Codex to finish the turn.
 
 ## How It Works
 
-This uses Codex's native `notify` command, so it does not depend on a Skill being selected in a conversation.
+The installer uses Codex's native root-level `notify` setting. It installs a
+self-contained runtime under `${CODEX_HOME:-$HOME/.codex}/codex-turn-sound/`
+and writes an absolute command path into `config.toml`.
 
-The installer updates `~/.codex/config.toml` with your real home directory:
+Existing notification commands are preserved. Codex's JSON event payload is
+forwarded to them without blocking sound playback. Installation uses a lock,
+unique backup, atomic writes, and rollback if any commit step fails.
 
-```sh
-notify = ["/Users/you/.codex/codex-turn-sound/app/bin/codex-turn-sound", "turn-ended"]
-```
-
-Codex calls this command when a turn ends. The installer copies the runtime into `~/.codex/codex-turn-sound/app/`, so the tool keeps working even when the temporary `npm exec` download is removed.
-
-If a previous Codex `notify` command existed, this tool preserves it and runs it before playing the sound.
+The tool also recognizes the `--previous-notify` chain used by Codex Computer
+Use, so upgrades and uninstalls preserve that outer notification wrapper.
 
 ## Change the Sound
 
-Use a macOS system sound by name:
+Install with any audio file supported by macOS `afplay`:
 
 ```sh
-CODEX_TURN_SOUND=Glass ~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
+npm exec --yes --package='github:verycafe/Coling#v0.2.0' -- codex-turn-sound install --sound /absolute/path/to/sound.wav
 ```
 
-Use any audio file supported by `afplay`:
+The installer validates and copies the custom sound into its managed runtime,
+so moving the original file later does not break playback. Updates preserve the
+managed custom sound unless `install --reset-sound` is used.
+
+Use a macOS system sound for one manual run:
 
 ```sh
-CODEX_TURN_SOUND=/absolute/path/to/sound.wav ~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
+CODEX_TURN_SOUND=Glass "${CODEX_HOME:-$HOME/.codex}/codex-turn-sound/app/bin/codex-turn-sound" turn-ended
 ```
 
-Disable sound for one run:
+Disable one manual run:
 
 ```sh
-CODEX_TURN_SOUND=off ~/.codex/codex-turn-sound/app/bin/codex-turn-sound turn-ended
+CODEX_TURN_SOUND=off "${CODEX_HOME:-$HOME/.codex}/codex-turn-sound/app/bin/codex-turn-sound" turn-ended
 ```
 
-Install with a custom sound:
+## Update
+
+Run the pinned installation command again:
 
 ```sh
-npm exec --yes --package github:verycafe/Coling codex-turn-sound -- install --sound /absolute/path/to/sound.wav
+npm exec --yes --package='github:verycafe/Coling#v0.2.0' -- codex-turn-sound install
 ```
 
 ## Uninstall
 
-Run:
+For every version, including an older installed runtime, use the pinned
+uninstaller:
 
 ```sh
-npm exec --yes --package github:verycafe/Coling codex-turn-sound -- uninstall
+npm exec --yes --package='github:verycafe/Coling#v0.2.0' -- codex-turn-sound uninstall
 ```
 
-The uninstaller restores the previous `notify` command when one was present.
+It restores the previous notification chain and removes the managed runtime and
+state files. A uniquely named `config.toml.bak-uninstall-*` backup is retained.
+The zero-byte `${CODEX_HOME:-$HOME/.codex}/.codex-turn-sound.lock` file is also
+retained intentionally so concurrent future installs always coordinate on the
+same lock inode.
+
+After updating to v0.2.0, the local offline command is also available:
+
+```sh
+"${CODEX_HOME:-$HOME/.codex}/codex-turn-sound/app/bin/codex-turn-sound" uninstall
+```
+
+## Diagnose
+
+```sh
+"${CODEX_HOME:-$HOME/.codex}/codex-turn-sound/app/bin/codex-turn-sound" doctor
+```
+
+Use `doctor --json` for structured results or `doctor --play` to validate
+playback. The command checks the active config chain, runtime version, managed
+sound, checksum, and macOS audio support without recording Codex event payloads.
 
 ## Develop Locally
-
-Clone the repository:
 
 ```sh
 git clone https://github.com/verycafe/Coling.git
 cd Coling
-```
-
-Run checks:
-
-```sh
 npm test
+npm run pack:check
 ```
 
-Generate the bundled sound again:
+Regenerate the bundled sound:
 
 ```sh
 python3 scripts/make_sound.py assets/soft-chime.wav

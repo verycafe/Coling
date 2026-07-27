@@ -1,256 +1,392 @@
 #!/usr/bin/env python3
-"""Install codex-turn-sound by wiring Codex's native notify command."""
+"""Install codex-turn-sound through Codex's native notify command."""
 
 from __future__ import annotations
 
 import argparse
-import ast
+import hashlib
 import json
 import os
-import re
-import shlex
+import secrets
 import shutil
 import subprocess
 import sys
-import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+
+from common import (
+    PACKAGE_VERSION,
+    STATE_SCHEMA_VERSION,
+    Paths,
+    StateError,
+    atomic_write_text,
+    build_paths,
+    command_contains_tool,
+    command_chain_looks_like_tool,
+    command_is_tool,
+    ensure_private_directory,
+    ensure_managed_file,
+    installation_lock,
+    load_state,
+    restore_snapshot,
+    rewrite_nested_tool,
+    snapshot,
+    validate_config_path,
+    validate_runtime_paths,
+    validate_state_for_paths,
+)
+from config_toml import ConfigError, read_notify, render_array, set_notify
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
-STATE_DIR = Path(os.environ.get("CODEX_TURN_SOUND_STATE_DIR", Path.home() / ".codex" / "codex-turn-sound")).expanduser()
-INSTALL_ROOT = STATE_DIR / "app"
-TARGET_NOTIFY = INSTALL_ROOT / "bin" / "codex-turn-sound"
-DEFAULT_SOUND = INSTALL_ROOT / "assets" / "soft-chime.wav"
-STATE_JSON = STATE_DIR / "state.json"
-STATE_ZSH = STATE_DIR / "original-notify.zsh"
-ROOT_NOTIFY_RE = re.compile(r"^\s*notify\s*=")
-TABLE_HEADER_RE = re.compile(r"^\s*\[")
 
 
-def parse_notify_value(value_text: str) -> list[str]:
-    value = ast.literal_eval(value_text)
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("notify must be a string array")
-    return value
+def unique_suffix() -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return f"{timestamp}-{secrets.token_hex(4)}"
 
 
-def root_table_start(lines: list[str]) -> int:
-    for index, line in enumerate(lines):
-        if TABLE_HEADER_RE.match(line):
-            return index
-    return len(lines)
+def validate_platform() -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("codex-turn-sound currently supports macOS only")
+    if sys.version_info < (3, 11):
+        raise RuntimeError("Python 3.11 or newer is required")
+    for executable in (Path("/bin/zsh"), Path("/usr/bin/afplay"), Path("/usr/bin/afinfo")):
+        if not executable.exists():
+            raise RuntimeError(f"Required macOS executable not found: {executable}")
 
 
-def find_root_notify(text: str) -> tuple[list[str], int | None, int | None, list[str] | None]:
-    lines = text.splitlines(keepends=True)
-    root_end = root_table_start(lines)
-    for start in range(root_end):
-        if not ROOT_NOTIFY_RE.match(lines[start]):
-            continue
-        for stop in range(start + 1, root_end + 1):
-            candidate = "".join(lines[start:stop])
-            value_text = candidate.split("=", 1)[1]
-            try:
-                value = parse_notify_value(value_text)
-            except (SyntaxError, ValueError):
-                continue
-            return lines, start, stop, value
-        raise ValueError("root notify exists but is not a string array")
-    return lines, None, None, None
+def validate_sound(path: Path) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"Sound file is not a regular file: {path}")
+    if not os.access(path, os.R_OK):
+        raise PermissionError(f"Sound file is not readable: {path}")
+    result = subprocess.run(
+        ["/usr/bin/afinfo", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "unsupported or damaged audio"
+        raise ValueError(f"Sound file failed validation: {detail}")
 
 
-def parse_notify(text: str) -> list[str] | None:
-    _, _, _, value = find_root_notify(text)
-    return value
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def toml_array(items: list[str]) -> str:
-    return "[" + ", ".join(json.dumps(item) for item in items) + "]"
+def stage_runtime(
+    paths: Paths, custom_sound: Path | None
+) -> tuple[Path, Path, str, str]:
+    validate_runtime_paths(paths)
+    stage = paths.state_dir / f".app-stage-{unique_suffix()}"
 
-
-def write_notify(text: str, notify: list[str]) -> str:
-    rendered = toml_array(notify)
-    lines, start, stop, _ = find_root_notify(text)
-    if start is not None and stop is not None:
-        lines[start:stop] = [f"notify = {rendered}\n"]
-        return "".join(lines)
-
-    root_end = root_table_start(lines)
-    insertion = [f"notify = {rendered}\n", "\n"]
-    if root_end == 0:
-        lines[0:0] = insertion
-        return "".join(lines)
-    if lines and not lines[root_end - 1].endswith("\n"):
-        lines[root_end - 1] += "\n"
-    lines[root_end:root_end] = insertion
-    return "".join(lines)
-
-
-def shell_array(items: list[str]) -> str:
-    if not items:
-        return "()"
-    return "( " + " ".join(shlex.quote(item) for item in items) + " )"
-
-
-def existing_state() -> dict[str, Any]:
-    if not STATE_JSON.exists():
-        return {}
-    try:
-        payload = json.loads(STATE_JSON.read_text())
-    except json.JSONDecodeError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def is_this_tool(command: list[str] | None) -> bool:
-    if not command:
-        return False
-    state = existing_state()
-    previous_installed = state.get("installed_notify")
-    if isinstance(previous_installed, list) and command == previous_installed:
-        return True
-    try:
-        path = Path(command[0]).expanduser().resolve()
-    except OSError:
-        return False
-    return path == TARGET_NOTIFY.resolve()
-
-
-def legacy_original_notify(command: list[str] | None) -> list[str] | None:
-    if not command:
-        return None
-    path = Path(command[0]).expanduser()
-    if path.name != "codex-turn-ended-sound.sh" or not path.exists():
-        return None
-    match = re.search(r'^ORIGINAL_NOTIFY="([^"]+)"', path.read_text(errors="ignore"), re.M)
-    if not match:
-        return None
-    return [match.group(1), *command[1:]]
-
-
-def choose_original_notify(current: list[str] | None) -> list[str]:
-    state = existing_state()
-    previous = state.get("original_notify")
-    if is_this_tool(current) and isinstance(previous, list):
-        return [str(item) for item in previous if isinstance(item, str)]
-
-    legacy = legacy_original_notify(current)
-    if legacy:
-        return legacy
-
-    return current or []
-
-
-def validate_toml(path: Path) -> None:
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        return
-    tomllib.loads(path.read_text())
-
-
-def copy_runtime() -> None:
-    source = SOURCE_ROOT.resolve()
-    target = INSTALL_ROOT.resolve()
-    if source == target:
-        return
-
-    tmp_target = STATE_DIR / f".app-tmp-{int(time.time())}-{os.getpid()}"
-    if tmp_target.exists():
-        shutil.rmtree(tmp_target)
-
-    def ignore(_dir: str, names: list[str]) -> set[str]:
+    def ignore(_directory: str, names: list[str]) -> set[str]:
+        excluded = {
+            ".git",
+            ".github",
+            ".gitignore",
+            ".npmrc",
+            ".DS_Store",
+            "__pycache__",
+            "node_modules",
+            "tests",
+        }
         return {
             name
             for name in names
-            if name in {".git", ".DS_Store", "__pycache__", "node_modules"}
-            or name.endswith(".pyc")
+            if name in excluded or name.endswith((".pyc", ".tgz"))
         }
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, tmp_target, ignore=ignore)
-    if INSTALL_ROOT.exists():
-        shutil.rmtree(INSTALL_ROOT)
-    tmp_target.rename(INSTALL_ROOT)
-
-    for path in (
-        INSTALL_ROOT / "bin" / "codex-turn-sound",
-        INSTALL_ROOT / "install.sh",
-        INSTALL_ROOT / "uninstall.sh",
-        INSTALL_ROOT / "scripts" / "install.py",
-        INSTALL_ROOT / "scripts" / "uninstall.py",
-        INSTALL_ROOT / "scripts" / "make_sound.py",
-    ):
-        if path.exists():
-            path.chmod(path.stat().st_mode | 0o755)
-
-
-def ensure_sound(sound_path: Path) -> None:
-    if sound_path.exists():
-        return
-    if sound_path != DEFAULT_SOUND:
-        raise FileNotFoundError(f"Sound file not found: {sound_path}")
-    subprocess.run(
-        [sys.executable, str(INSTALL_ROOT / "scripts" / "make_sound.py"), str(DEFAULT_SOUND)],
-        check=True,
-    )
-
-
-def install(config_path: Path, sound_path: Path) -> None:
-    copy_runtime()
-    ensure_sound(sound_path)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    text = config_path.read_text() if config_path.exists() else ""
-    current_notify = parse_notify(text)
-    original_notify = choose_original_notify(current_notify)
-
-    backup_path = None
-    if config_path.exists():
-        backup_path = config_path.with_suffix(
-            config_path.suffix + f".bak-{time.strftime('%Y%m%d-%H%M%S')}"
-        )
-        shutil.copy2(config_path, backup_path)
-
-    new_notify = [str(TARGET_NOTIFY), "turn-ended"]
     try:
-        config_path.write_text(write_notify(text, new_notify))
-        validate_toml(config_path)
-    except Exception:
-        config_path.write_text(text)
+        shutil.copytree(paths.source_root, stage, ignore=ignore)
+        for relative in (
+            "bin/codex-turn-sound",
+            "install.sh",
+            "uninstall.sh",
+            "scripts/install.py",
+            "scripts/uninstall.py",
+            "scripts/make_sound.py",
+            "scripts/config_toml.py",
+            "scripts/common.py",
+            "scripts/notify_runtime.py",
+            "scripts/doctor.py",
+        ):
+            executable = stage / relative
+            if executable.exists():
+                executable.chmod(executable.stat().st_mode | 0o755)
+
+        if custom_sound is None:
+            staged_sound = stage / "assets" / "soft-chime.wav"
+            validate_sound(staged_sound)
+            installed_sound = paths.install_root / "assets" / "soft-chime.wav"
+            sound_kind = "bundled"
+        else:
+            validate_sound(custom_sound)
+            suffix = custom_sound.suffix.lower() or ".audio"
+            staged_sound = stage / "assets" / f"custom-sound{suffix}"
+            shutil.copy2(custom_sound, staged_sound)
+            staged_sound.chmod(0o600)
+            installed_sound = paths.install_root / "assets" / staged_sound.name
+            sound_kind = "custom"
+        return stage, installed_sound, sound_kind, file_sha256(staged_sound)
+    except Exception as error:
+        try:
+            if stage.exists():
+                shutil.rmtree(stage)
+        except Exception as cleanup_error:
+            raise ExceptionGroup(
+                "runtime staging failed and cleanup was incomplete",
+                [error, cleanup_error],
+            )
         raise
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_JSON.write_text(
-        json.dumps(
-            {
+
+def effective_original_notify(
+    current: list[str] | None,
+    state: dict | None,
+    paths: Paths,
+    config_path: Path,
+) -> tuple[list[str], bool]:
+    installed = (
+        state["installed_notify"]
+        if state is not None
+        else [str(paths.target_notify), "turn-ended"]
+    )
+    current_has_tool = command_contains_tool(current, installed, paths.target_notify)
+
+    if state and state.get("schema_version") == STATE_SCHEMA_VERSION:
+        previous_config = Path(state["config_path"]).expanduser().resolve()
+        if previous_config != config_path:
+            if current_has_tool:
+                raise StateError(
+                    f"state.json belongs to another config: {previous_config}"
+                )
+            previous_text = (
+                previous_config.read_text(encoding="utf-8")
+                if previous_config.exists()
+                else ""
+            )
+            previous_notify = read_notify(previous_text)
+            if command_contains_tool(
+                previous_notify, state["installed_notify"], paths.target_notify
+            ):
+                raise StateError(
+                    f"codex-turn-sound is still installed in another config: {previous_config}"
+                )
+
+    if current_has_tool:
+        if state is None:
+            raise StateError(
+                "Codex config points to codex-turn-sound but state.json is missing; "
+                "restore a config backup before reinstalling"
+            )
+        original = state["original_notify"]
+        if command_contains_tool(
+            original, installed, paths.target_notify
+        ) or command_chain_looks_like_tool(original):
+            raise StateError("state.json would make codex-turn-sound invoke itself")
+        original_present = state.get("original_notify_present", bool(original))
+        if command_is_tool(current, installed, paths.target_notify):
+            return list(original), original_present
+        rewritten, changed = rewrite_nested_tool(
+            current or [], installed, paths.target_notify, original
+        )
+        if not changed:
+            raise StateError("Could not safely unwrap the existing notify chain")
+        return rewritten, True
+
+    if command_chain_looks_like_tool(current):
+        raise StateError(
+            "Codex config contains an unrecognized codex-turn-sound path; "
+            "restore or remove it before installing"
+        )
+
+    return list(current or []), current is not None
+
+
+def preserved_custom_sound(
+    state: dict | None,
+    current: list[str] | None,
+    paths: Paths,
+    reset_sound: bool,
+) -> Path | None:
+    if reset_sound or state is None:
+        return None
+    if not command_contains_tool(
+        current, state["installed_notify"], paths.target_notify
+    ):
+        return None
+    sound_kind = state.get("sound_kind")
+    sound_path = Path(state["sound_path"]).expanduser().resolve()
+    is_custom = sound_kind == "custom" or (
+        sound_kind is None and sound_path.name != "soft-chime.wav"
+    )
+    if not is_custom:
+        return None
+    validate_sound(sound_path)
+    expected_hash = state.get("sound_sha256")
+    if expected_hash and file_sha256(sound_path) != expected_hash:
+        raise StateError(
+            "managed custom sound checksum changed; pass --sound explicitly "
+            "to accept a replacement"
+        )
+    return sound_path
+
+
+def _swap_runtime(paths: Paths, stage: Path) -> Path | None:
+    rollback = None
+    try:
+        if paths.install_root.exists():
+            rollback = paths.state_dir / f".app-rollback-{unique_suffix()}"
+            os.replace(paths.install_root, rollback)
+        os.replace(stage, paths.install_root)
+    except Exception:
+        if rollback and rollback.exists() and not paths.install_root.exists():
+            os.replace(rollback, paths.install_root)
+        raise
+    return rollback
+
+
+def _restore_runtime(paths: Paths, rollback: Path | None) -> None:
+    if paths.install_root.exists():
+        shutil.rmtree(paths.install_root)
+    if rollback and rollback.exists():
+        os.replace(rollback, paths.install_root)
+
+
+def install(
+    config_path: Path,
+    custom_sound: Path | None = None,
+    reset_sound: bool = False,
+) -> None:
+    validate_platform()
+    paths = build_paths(SOURCE_ROOT)
+    config_path = config_path.expanduser().resolve()
+    custom_sound = custom_sound.expanduser().resolve() if custom_sound else None
+    if custom_sound is not None and reset_sound:
+        raise ValueError("--sound and --reset-sound cannot be used together")
+    validate_config_path(config_path, paths)
+
+    with installation_lock(paths):
+        ensure_private_directory(paths.state_dir)
+        ensure_managed_file(paths.state_json)
+        ensure_managed_file(paths.state_zsh)
+        state_before = snapshot(paths.state_json)
+        zsh_before = snapshot(paths.state_zsh)
+        state = load_state(paths.state_json)
+        validate_state_for_paths(state, paths)
+
+        config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        config_before = snapshot(config_path)
+        config_text = config_before.content.decode("utf-8") if config_before.exists else ""
+        current_notify = read_notify(config_text)
+        original_notify, original_notify_present = effective_original_notify(
+            current_notify, state, paths, config_path
+        )
+        selected_sound = custom_sound or preserved_custom_sound(
+            state, current_notify, paths, reset_sound
+        )
+
+        stage = None
+        rollback = None
+        runtime_swapped = False
+        backup_path = None
+        try:
+            stage, installed_sound, sound_kind, sound_sha256 = stage_runtime(
+                paths, selected_sound
+            )
+            new_notify = [str(paths.target_notify), "turn-ended"]
+            new_config = set_notify(config_text, new_notify)
+
+            if config_before.exists:
+                backup_path = config_path.with_name(
+                    f"{config_path.name}.bak-install-{unique_suffix()}"
+                )
+                shutil.copy2(config_path, backup_path)
+
+            if snapshot(config_path) != config_before:
+                raise StateError("config.toml changed while installation was being prepared")
+
+            state_payload = {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "package_version": PACKAGE_VERSION,
+                "config_path": str(config_path),
                 "installed_notify": new_notify,
                 "original_notify": original_notify,
-                "sound_path": str(sound_path),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    STATE_ZSH.write_text(
-        "# Generated by codex-turn-sound. Do not edit while installed.\n"
-        "typeset -ga ORIGINAL_NOTIFY\n"
-        f"ORIGINAL_NOTIFY={shell_array(original_notify)}\n"
-        f"TURN_SOUND_PATH={shlex.quote(str(sound_path))}\n"
-    )
+                "original_notify_present": original_notify_present,
+                "sound_path": str(installed_sound),
+                "sound_kind": sound_kind,
+                "sound_sha256": sound_sha256,
+                "config_backup": str(backup_path) if backup_path else None,
+            }
 
-    print(f"installed_notify={toml_array(new_notify)}")
-    print(f"sound={sound_path}")
+            atomic_write_text(
+                paths.state_json,
+                json.dumps(state_payload, ensure_ascii=False, indent=2) + "\n",
+                0o600,
+            )
+            rollback = _swap_runtime(paths, stage)
+            runtime_swapped = True
+            stage = None
+
+            if snapshot(config_path) != config_before:
+                raise StateError("config.toml changed before the installation could commit")
+            atomic_write_text(
+                config_path,
+                new_config,
+                config_before.mode if config_before.exists else 0o600,
+            )
+            paths.state_zsh.unlink(missing_ok=True)
+        except Exception as error:
+            rollback_errors: list[Exception] = []
+            actions = [
+                lambda: restore_snapshot(config_path, config_before),
+                lambda: restore_snapshot(paths.state_json, state_before),
+                lambda: restore_snapshot(paths.state_zsh, zsh_before),
+            ]
+            if runtime_swapped:
+                actions.append(lambda: _restore_runtime(paths, rollback))
+            if stage and stage.exists():
+                actions.append(lambda: shutil.rmtree(stage))
+            if backup_path:
+                actions.append(lambda: backup_path.unlink(missing_ok=True))
+            for action in actions:
+                try:
+                    action()
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+            if rollback_errors:
+                raise ExceptionGroup(
+                    "installation failed and rollback was incomplete",
+                    [error, *rollback_errors],
+                )
+            raise
+        else:
+            if rollback and rollback.exists():
+                shutil.rmtree(rollback)
+
+    print(f"installed_notify={render_array(new_notify)}")
+    print(f"sound={installed_sound}")
     if backup_path:
         print(f"backup={backup_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(Path.home() / ".codex" / "config.toml"))
-    parser.add_argument("--sound", default=str(DEFAULT_SOUND))
+    parser.add_argument("--config")
+    parser.add_argument("--sound")
+    parser.add_argument("--reset-sound", action="store_true")
     args = parser.parse_args()
-    install(Path(args.config).expanduser().resolve(), Path(args.sound).expanduser().resolve())
+    paths = build_paths(SOURCE_ROOT)
+    config = Path(args.config) if args.config else paths.codex_home / "config.toml"
+    sound = Path(args.sound) if args.sound else None
+    try:
+        install(config, sound, args.reset_sound)
+    except (ConfigError, StateError, OSError, ValueError, RuntimeError) as error:
+        parser.exit(1, f"codex-turn-sound: {error}\n")
 
 
 if __name__ == "__main__":

@@ -1,137 +1,238 @@
 #!/usr/bin/env python3
-"""Restore the previous Codex notify command."""
+"""Restore the previous Codex notify command and remove installed runtime files."""
 
 from __future__ import annotations
 
 import argparse
-import ast
-import json
-import os
-import re
 import shutil
-import time
 from pathlib import Path
 
-
-STATE_DIR = Path(os.environ.get("CODEX_TURN_SOUND_STATE_DIR", Path.home() / ".codex" / "codex-turn-sound")).expanduser()
-INSTALL_ROOT = STATE_DIR / "app"
-TARGET_NOTIFY = INSTALL_ROOT / "bin" / "codex-turn-sound"
-STATE_JSON = STATE_DIR / "state.json"
-ROOT_NOTIFY_RE = re.compile(r"^\s*notify\s*=")
-TABLE_HEADER_RE = re.compile(r"^\s*\[")
-
-
-def parse_notify_value(value_text: str) -> list[str]:
-    value = ast.literal_eval(value_text)
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("notify must be a string array")
-    return value
-
-
-def root_table_start(lines: list[str]) -> int:
-    for index, line in enumerate(lines):
-        if TABLE_HEADER_RE.match(line):
-            return index
-    return len(lines)
+from common import (
+    STATE_SCHEMA_VERSION,
+    StateError,
+    atomic_write_text,
+    build_paths,
+    command_is_tool,
+    command_contains_tool,
+    command_chain_looks_like_tool,
+    installation_lock,
+    load_state,
+    rewrite_nested_tool,
+    snapshot,
+    validate_config_path,
+    validate_runtime_paths,
+    validate_state_for_paths,
+)
+from config_toml import ConfigError, read_notify, remove_notify, render_array, set_notify
 
 
-def find_root_notify(text: str) -> tuple[list[str], int | None, int | None, list[str] | None]:
-    lines = text.splitlines(keepends=True)
-    root_end = root_table_start(lines)
-    for start in range(root_end):
-        if not ROOT_NOTIFY_RE.match(lines[start]):
-            continue
-        for stop in range(start + 1, root_end + 1):
-            candidate = "".join(lines[start:stop])
-            value_text = candidate.split("=", 1)[1]
-            try:
-                value = parse_notify_value(value_text)
-            except (SyntaxError, ValueError):
-                continue
-            return lines, start, stop, value
-        raise ValueError("root notify exists but is not a string array")
-    return lines, None, None, None
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 
-def parse_notify(text: str) -> list[str] | None:
-    _, _, _, value = find_root_notify(text)
-    return value
+def unique_backup(config_path: Path) -> Path:
+    from install import unique_suffix
 
-
-def toml_array(items: list[str]) -> str:
-    return "[" + ", ".join(json.dumps(item) for item in items) + "]"
-
-
-def is_this_tool(command: list[str] | None) -> bool:
-    if not command:
-        return False
-    if STATE_JSON.exists():
-        try:
-            state = json.loads(STATE_JSON.read_text())
-        except json.JSONDecodeError:
-            state = {}
-        installed = state.get("installed_notify") if isinstance(state, dict) else None
-        if isinstance(installed, list) and command == installed:
-            return True
-    try:
-        path = Path(command[0]).expanduser().resolve()
-    except OSError:
-        return False
-    return path == TARGET_NOTIFY.resolve()
-
-
-def replace_or_remove_notify(text: str, original_notify: list[str]) -> str:
-    lines, start, stop, _ = find_root_notify(text)
-    if start is None or stop is None:
-        return text
-    if original_notify:
-        lines[start:stop] = [f"notify = {toml_array(original_notify)}\n"]
-    else:
-        lines[start:stop] = []
-    return "".join(lines)
-
-
-def load_state() -> dict:
-    if not STATE_JSON.exists():
-        return {}
-    try:
-        payload = json.loads(STATE_JSON.read_text())
-    except json.JSONDecodeError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def uninstall(config_path: Path) -> None:
-    if not config_path.exists():
-        print(f"config not found: {config_path}")
-        return
-
-    text = config_path.read_text()
-    current_notify = parse_notify(text)
-    if not is_this_tool(current_notify):
-        print("current notify is not codex-turn-sound; nothing changed")
-        return
-
-    state = load_state()
-    original_notify = state.get("original_notify", [])
-    if not isinstance(original_notify, list):
-        original_notify = []
-    original_notify = [str(item) for item in original_notify if isinstance(item, str)]
-
-    backup_path = config_path.with_suffix(
-        config_path.suffix + f".bak-uninstall-{time.strftime('%Y%m%d-%H%M%S')}"
+    return config_path.with_name(
+        f"{config_path.name}.bak-uninstall-{unique_suffix()}"
     )
-    shutil.copy2(config_path, backup_path)
-    config_path.write_text(replace_or_remove_notify(text, original_notify))
-    print(f"restored_notify={toml_array(original_notify) if original_notify else '<removed>'}")
-    print(f"backup={backup_path}")
+
+
+def quarantine_managed_files(paths) -> list[tuple[Path, Path]]:
+    from install import unique_suffix
+
+    suffix = unique_suffix()
+    pairs: list[tuple[Path, Path]] = []
+    candidates = (
+        (paths.install_root, paths.state_dir / f".uninstall-{suffix}-app"),
+        (paths.state_json, paths.state_dir / f".uninstall-{suffix}-state.json"),
+        (paths.state_zsh, paths.state_dir / f".uninstall-{suffix}-state.zsh"),
+    )
+    try:
+        for source, target in candidates:
+            if source.exists():
+                source.replace(target)
+                pairs.append((source, target))
+    except Exception as error:
+        rollback_errors: list[Exception] = []
+        for source, target in reversed(pairs):
+            try:
+                if target.exists():
+                    target.replace(source)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise ExceptionGroup(
+                "uninstall quarantine failed and rollback was incomplete",
+                [error, *rollback_errors],
+            )
+        raise
+    return pairs
+
+
+def restore_quarantine(pairs: list[tuple[Path, Path]]) -> list[Exception]:
+    errors: list[Exception] = []
+    for source, target in reversed(pairs):
+        try:
+            if target.exists():
+                target.replace(source)
+        except Exception as error:
+            errors.append(error)
+    return errors
+
+
+def delete_quarantine(pairs: list[tuple[Path, Path]]) -> list[str]:
+    warnings: list[str] = []
+    for _source, target in pairs:
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError as error:
+            warnings.append(f"could not remove quarantined file {target}: {error}")
+    return warnings
+
+
+def uninstall(config_argument: Path | None) -> None:
+    paths = build_paths(SOURCE_ROOT)
+    validate_runtime_paths(paths)
+    not_installed = False
+    cleanup_warnings: list[str] = []
+
+    with installation_lock(paths):
+        state = load_state(paths.state_json)
+        validate_state_for_paths(state, paths)
+        if state is None:
+            config_path = (
+                config_argument.expanduser().resolve()
+                if config_argument
+                else paths.codex_home / "config.toml"
+            )
+            text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            current = read_notify(text)
+            expected = [str(paths.target_notify), "turn-ended"]
+            if command_chain_looks_like_tool(current) or command_contains_tool(
+                current, expected, paths.target_notify
+            ):
+                raise StateError(
+                    "Codex config points to codex-turn-sound but state.json is missing; "
+                    "restore a config backup instead of removing notify blindly"
+                )
+            not_installed = True
+            original = []
+            backup_path = None
+        else:
+            if config_argument is not None:
+                config_path = config_argument.expanduser().resolve()
+            elif state.get("schema_version") == STATE_SCHEMA_VERSION:
+                config_path = Path(state["config_path"]).expanduser().resolve()
+            else:
+                config_path = paths.codex_home / "config.toml"
+
+            if state.get("schema_version") == STATE_SCHEMA_VERSION:
+                recorded = Path(state["config_path"]).expanduser().resolve()
+                if recorded != config_path:
+                    raise StateError(
+                        f"state.json belongs to {recorded}, not requested config {config_path}"
+                    )
+            validate_config_path(config_path, paths)
+
+            if not config_path.exists():
+                raise StateError(f"Codex config not found: {config_path}")
+
+            config_before = snapshot(config_path)
+            text = config_before.content.decode("utf-8")
+            current = read_notify(text)
+            installed = state["installed_notify"]
+            original = state["original_notify"]
+
+            if command_contains_tool(
+                original, installed, paths.target_notify
+            ) or command_chain_looks_like_tool(original):
+                raise StateError("state.json contains a recursive original notify command")
+
+            changed = False
+            if command_is_tool(current, installed, paths.target_notify):
+                original_present = state.get("original_notify_present", bool(original))
+                updated = (
+                    set_notify(text, original)
+                    if original_present
+                    else remove_notify(text)
+                )
+                changed = True
+            elif current:
+                rewritten, nested_changed = rewrite_nested_tool(
+                    current, installed, paths.target_notify, original
+                )
+                if nested_changed:
+                    updated = set_notify(text, rewritten)
+                    changed = True
+                else:
+                    updated = text
+            else:
+                updated = text
+
+            backup_path = None
+            if changed:
+                backup_path = unique_backup(config_path)
+                shutil.copy2(config_path, backup_path)
+                if snapshot(config_path) != config_before:
+                    backup_path.unlink(missing_ok=True)
+                    raise StateError("config.toml changed while uninstall was being prepared")
+            quarantined: list[tuple[Path, Path]] = []
+            try:
+                if changed:
+                    atomic_write_text(config_path, updated, config_before.mode)
+                quarantined = quarantine_managed_files(paths)
+            except Exception as error:
+                rollback_errors = restore_quarantine(quarantined)
+                try:
+                    if changed and snapshot(config_path) != config_before:
+                        atomic_write_text(
+                            config_path,
+                            config_before.content.decode("utf-8"),
+                            config_before.mode,
+                        )
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if backup_path:
+                    try:
+                        backup_path.unlink(missing_ok=True)
+                    except Exception as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise ExceptionGroup(
+                        "uninstall failed and rollback was incomplete",
+                        [error, *rollback_errors],
+                    )
+                raise
+            cleanup_warnings = delete_quarantine(quarantined)
+
+    if paths.state_dir.exists():
+        try:
+            paths.state_dir.rmdir()
+        except OSError:
+            pass
+
+    if not_installed:
+        print("codex-turn-sound is not installed")
+        return
+
+    print(f"restored_notify={render_array(original) if original else '<removed>'}")
+    if backup_path:
+        print(f"backup={backup_path}")
+    for warning in cleanup_warnings:
+        print(f"warning={warning}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(Path.home() / ".codex" / "config.toml"))
+    parser.add_argument("--config")
     args = parser.parse_args()
-    uninstall(Path(args.config).expanduser().resolve())
+    try:
+        uninstall(Path(args.config) if args.config else None)
+    except (ConfigError, StateError, OSError, ValueError, RuntimeError) as error:
+        parser.exit(1, f"codex-turn-sound: {error}\n")
 
 
 if __name__ == "__main__":
